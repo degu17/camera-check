@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-/* Layout: 1カラム。プレビュー → 判定 → 項目リスト の順に、上から読むだけで原因に辿り着く構成 */
+/* Layout: 1カラム。プレビュー → 判定 → 項目リスト（環境 / 設定・機能 / カメラ）の順に読む構成 */
 :root{
   --bg:#f3f5f6; --surface:#ffffff; --fg:#16201f; --muted:#5d6b6a; --line:#d8dfdf;
   --accent:#0f6e6a; --accent-fg:#ffffff;
@@ -119,7 +119,7 @@ ol.steps li:first-child{border-top:0}
 <main class="wrap">
   <header>
     <h1>カメラ起動チェッカー</h1>
-    <p class="lead">顔認証の前に、ブラウザでカメラが起動して映像が映るかを確認します。</p>
+    <p class="lead">顔認証の前に、ブラウザの設定と、カメラが起動して映像が映るかを確認します。</p>
   </header>
 
   <div class="preview" id="preview">
@@ -139,12 +139,14 @@ ol.steps li:first-child{border-top:0}
   <button type="button" class="btn btn-primary tap" id="tapplay" hidden>タップして映像を再生</button>
 
   <div class="verdict" id="verdict" data-s="pending">
-    <strong id="verdict-title">未チェック</strong>
-    <span id="verdict-detail">環境の確認が終わったら「チェック開始」をタップしてください。</span>
+    <strong id="verdict-title">確認中</strong>
+    <span id="verdict-detail">設定の確認が終わるまでお待ちください。</span>
   </div>
 
   <p class="group-label">環境（ページを開いた時点で確認）</p>
   <ol class="steps" id="steps-env"></ol>
+  <p class="group-label">ブラウザの設定・機能（ページを開いた時点で確認）</p>
+  <ol class="steps" id="steps-set"></ol>
   <p class="group-label">カメラ（チェック開始で確認）</p>
   <ol class="steps" id="steps-cam"></ol>
 
@@ -165,20 +167,56 @@ ol.steps li:first-child{border-top:0}
     ["browser", "ブラウザの種類"],
     ["perm", "カメラ権限"],
   ];
+  const SET_STEPS = [
+    ["ip", "接続元IP・iCloudプライベートリレー"],
+    ["blocker", "コンテンツブロッカー・広告ブロック"],
+    ["cdn", "顔検出データの読み込み"],
+    ["storage", "Cookie・ストレージ"],
+    ["fp", "フィンガープリンティング保護"],
+    ["webgl", "WebGL（画像処理）"],
+    ["wasm", "WebAssembly（顔検出エンジン）"],
+    ["worker", "Web Worker（並列処理）"],
+    ["webrtc", "WebRTC（映像のリアルタイム送信）"],
+    ["font", "Webフォントの読み込み"],
+    ["lockdown", "ロックダウンモード"],
+  ];
   const CAM_STEPS = [
     ["gum", "カメラの起動"],
     ["track", "映像トラック"],
     ["play", "プレビュー再生"],
     ["frames", "映像フレームの受信"],
     ["light", "映像の明るさ"],
+    ["rec", "録画（MediaRecorder）"],
   ];
+  const ALL_STEPS = [...ENV_STEPS, ...SET_STEPS, ...CAM_STEPS];
   const LABEL = { pending: "未実施", running: "確認中", pass: "OK", warn: "注意", fail: "NG", skip: "未実施", info: "情報" };
   const SEVERITY = { fail: 3, warn: 2, pass: 1, info: 0, pending: -1, skip: -1, running: -1 };
+
+  const PATH = {
+    relay: "設定 > [自分の名前] > iCloud > プライベートリレー",
+    ipLimit: "設定 > Wi-Fi > 接続中のネットワークの(i) > IPアドレスのトラッキングを制限",
+    ext: "設定 > アプリ > Safari > 機能拡張",
+    atfp: "設定 > アプリ > Safari > 詳細 > 高度なトラッキングとフィンガープリンティングからの保護",
+    cookie: "設定 > アプリ > Safari > すべてのCookieをブロック",
+    flags: "設定 > アプリ > Safari > 詳細 > 機能フラグ",
+    lockdown: "設定 > プライバシーとセキュリティ > ロックダウンモード",
+    vpn: "設定 > VPN（一般 > VPNとデバイス管理）",
+  };
 
   const $ = (id) => document.getElementById(id);
   const video = $("video"), btnStart = $("start"), btnStop = $("stop"), btnTap = $("tapplay");
   const state = {};
-  let stream = null, facing = "user", running = false, envOk = false;
+  let stream = null, facing = "user", running = false, envOk = false, settingsDone = false;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const errName = (e) => (e && e.name ? e.name : "不明なエラー");
+  function withTimeout(promise, ms) {
+    let t;
+    return Promise.race([
+      promise,
+      new Promise((_, rej) => { t = setTimeout(() => { const e = new Error("timeout"); e.name = "TimeoutError"; rej(e); }, ms); }),
+    ]).finally(() => clearTimeout(t));
+  }
 
   function buildList(el, steps) {
     for (const [id, title] of steps) {
@@ -204,13 +242,14 @@ ol.steps li:first-child{border-top:0}
     state[id].status = status;
     state[id].detail = detail;
     paint(id);
+    updateVerdict();
   }
   function skipFrom(id, reason) {
     const ids = CAM_STEPS.map((s) => s[0]);
     for (const k of ids.slice(ids.indexOf(id))) set(k, "skip", reason);
   }
 
-  /* ---------- 環境チェック ---------- */
+  /* ================= 環境 ================= */
   function detectBrowser() {
     const ua = navigator.userAgent;
     const inApp = [
@@ -256,25 +295,307 @@ ol.steps li:first-child{border-top:0}
     set("secure", secure ? "pass" : "fail",
       secure ? `${location.protocol.replace(":", "")} で開いています`
              : "HTTPSで開かれていません。カメラはHTTPSのページでしか使えません");
-
     const api = !!(navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function");
     set("api", api ? "pass" : "fail",
       api ? "カメラAPI（getUserMedia）が使えます"
           : "このブラウザ・この画面ではカメラAPIが使えません。Safariで開き直してください");
-
     const [bs, bd] = detectBrowser();
     set("browser", bs, bd);
     checkPermission();
-
     envOk = secure && api;
     if (!envOk) {
       btnStart.disabled = true;
       skipFrom("gum", "環境の項目にNGがあるため実施できません");
     }
+  }
+
+  /* ================= ブラウザの設定・機能 ================= */
+  async function probe(url, cors) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    try {
+      const r = await fetch(url, { mode: cors ? "cors" : "no-cors", cache: "no-store", signal: ctl.signal });
+      if (cors && !r.ok) return { ok: false, why: "HTTP " + r.status };
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, why: ctl.signal.aborted ? "タイムアウト" : errName(e) };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  async function checkIP() {
+    set("ip", "running", "接続元を確認しています");
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    let j;
+    try {
+      const r = await fetch("https://ipapi.co/json/", { cache: "no-store", signal: ctl.signal });
+      if (!r.ok) throw Object.assign(new Error("HTTP " + r.status), { name: "HTTP " + r.status });
+      j = await r.json();
+    } catch (e) {
+      set("ip", "warn", `接続元の情報を取得できませんでした（${ctl.signal.aborted ? "タイムアウト" : errName(e)}）。広告ブロックやDNSフィルタで外部通信が止められている可能性があります`);
+      return;
+    } finally {
+      clearTimeout(t);
+    }
+    if (j.error) {
+      set("ip", "warn", `接続元の情報を取得できませんでした（${j.reason || "理由不明"}）`);
+      return;
+    }
+    const relayAS = { AS13335: "Cloudflare", AS36183: "Akamai", AS54113: "Fastly" };
+    const asn = String(j.asn || "");
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const info = `${j.ip} / ${j.country_code || "国不明"} / ${j.org || "事業者不明"}（${asn || "AS不明"}）`;
+    const tzNote = j.timezone && j.timezone !== tz ? ` 端末のタイムゾーン（${tz}）とIPの地域（${j.timezone}）が一致しません。` : "";
+    if (j.country_code !== "JP") {
+      set("ip", "fail", `日本以外のIPと判定されています：${info}。${tzNote}本人確認サービスは海外IPを拒否することがあります。iCloudプライベートリレーかVPNを一時的にオフにしてください（${PATH.relay}／${PATH.vpn}）`);
+    } else if (relayAS[asn]) {
+      set("ip", "warn", `iCloudプライベートリレー（またはVPN）経由の可能性が高いです：${info}。${tzNote}本人確認サービスはこの経路を拒否することがあります。プライベートリレーは同じApple IDの全端末に適用されます。一時的にオフにして再度お試しください（${PATH.relay}）`);
+    } else {
+      set("ip", tzNote ? "warn" : "pass", `通常の回線です：${info}。${tzNote}`.trim());
+    }
+  }
+
+  async function checkBlocker() {
+    set("blocker", "running", "確認しています");
+    const bait = document.createElement("div");
+    bait.className = "adsbox ad-banner ad-unit adsbygoogle pub_300x250 text-ad";
+    bait.id = "ad_container";
+    bait.style.cssText = "position:absolute;left:-9999px;top:0;width:300px;height:250px";
+    bait.innerHTML = "&nbsp;";
+    document.body.appendChild(bait);
+    await sleep(400);
+    const cs = getComputedStyle(bait);
+    const hidden = bait.offsetHeight === 0 || cs.display === "none" || cs.visibility === "hidden";
+    bait.remove();
+    const net = await probe("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js", false);
+    const found = [];
+    if (hidden) found.push("広告表示を隠す機能拡張");
+    if (!net.ok) found.push(`広告通信の遮断（${net.why}）`);
+    if (found.length) {
+      set("blocker", "warn", `${found.join("・")}を検出しました。顔認証の部品まで止める場合があります。Safariの機能拡張は同じApple IDの端末間で同期されます。一時的に全てオフにしてください（${PATH.ext}）。ページ単位なら「ぁあ」→「Webサイトの設定」→「コンテンツブロッカーを使用」をオフ。DNS型の広告ブロックやVPNアプリを使っている場合はそれもオフ`);
+    } else {
+      set("blocker", "pass", "広告ブロックの動作は検出されませんでした");
+    }
+  }
+
+  async function checkCDN() {
+    set("cdn", "running", "確認しています");
+    const targets = [
+      ["cdn.jsdelivr.net", "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/package.json", true],
+      ["storage.googleapis.com", "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite", false],
+    ];
+    const res = await Promise.all(targets.map(async ([name, url, cors]) => [name, await probe(url, cors)]));
+    const ng = res.filter(([, r]) => !r.ok);
+    if (ng.length) {
+      set("cdn", "fail", `顔検出モデルの配信元に接続できません：${ng.map(([n, r]) => `${n}（${r.why}）`).join("、")}。コンテンツブロッカー、DNSフィルタ、VPNで止められている可能性があります`);
+    } else {
+      set("cdn", "pass", "顔検出モデルの代表的な配信元に接続できます");
+    }
+  }
+
+  async function checkStorage() {
+    const ng = [];
+    try {
+      document.cookie = "ckcheck=1; path=/; SameSite=Lax; Secure";
+      const ok = document.cookie.split("; ").includes("ckcheck=1");
+      document.cookie = "ckcheck=; path=/; Max-Age=0; SameSite=Lax; Secure";
+      if (!ok) ng.push("Cookie");
+    } catch (e) { ng.push("Cookie"); }
+    try {
+      localStorage.setItem("lscheck", "1");
+      if (localStorage.getItem("lscheck") !== "1") ng.push("localStorage");
+      localStorage.removeItem("lscheck");
+    } catch (e) { ng.push("localStorage"); }
+    try {
+      sessionStorage.setItem("sscheck", "1");
+      sessionStorage.removeItem("sscheck");
+    } catch (e) { ng.push("sessionStorage"); }
+    try {
+      await withTimeout(new Promise((res, rej) => {
+        const r = indexedDB.open("idbcheck");
+        r.onsuccess = () => { r.result.close(); indexedDB.deleteDatabase("idbcheck"); res(); };
+        r.onerror = () => rej(r.error);
+      }), 4000);
+    } catch (e) { ng.push("IndexedDB"); }
+    if (ng.length) {
+      set("storage", "fail", `${ng.join("・")}が使えません。「すべてのCookieをブロック」がオンの可能性が高いです（${PATH.cookie}）。この状態では多くの本人確認サービスがログイン状態を保てず、途中で止まります`);
+    } else {
+      set("storage", "pass", "Cookie・localStorage・sessionStorage・IndexedDB が使えます");
+    }
+  }
+
+  function checkFingerprint() {
+    const draw = () => {
+      const c = document.createElement("canvas");
+      c.width = 120; c.height = 40;
+      const ctx = c.getContext("2d", { willReadFrequently: true });
+      ctx.fillStyle = "rgb(10,200,30)";
+      ctx.fillRect(0, 0, 120, 40);
+      const g = ctx.createLinearGradient(0, 0, 60, 0);
+      g.addColorStop(0, "#123456");
+      g.addColorStop(1, "#abcdef");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 60, 20);
+      ctx.fillStyle = "#000";
+      ctx.font = "14px sans-serif";
+      ctx.fillText("eKYC 0123", 2, 34);
+      return ctx.getImageData(0, 0, 120, 40).data;
+    };
+    let a, b;
+    try {
+      a = draw(); b = draw();
+    } catch (e) {
+      set("fp", "fail", `画像を読み取れませんでした（${errName(e)}）。顔検出は画像の読み取りが前提のため動きません`);
+      return;
+    }
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diff++;
+    const base = ((40 - 10) * 120 + 110) * 4; // 右下の単色部分
+    const solidOk = a[base] === 10 && a[base + 1] === 200 && a[base + 2] === 30;
+    if (diff > 0 || !solidOk) {
+      set("fp", "warn", `画像の読み取り結果にノイズが入っています（差分 ${diff}）。「高度なトラッキングとフィンガープリンティングからの保護」が「すべてのブラウズ」になっているか、プライベートブラウズです。顔検出の精度が落ちる、または端末の不正判定で弾かれる原因になります。「プライベートブラウズ」に戻してください（${PATH.atfp}）`);
+    } else {
+      set("fp", "pass", "画像の読み取りにノイズは検出されませんでした");
+    }
+  }
+
+  function checkWebGL() {
+    const c = document.createElement("canvas");
+    let gl2 = null, gl = null;
+    try { gl2 = c.getContext("webgl2"); } catch (e) { gl2 = null; }
+    if (!gl2) { try { gl = c.getContext("webgl"); } catch (e) { gl = null; } }
+    const ctx = gl2 || gl;
+    if (!ctx) {
+      set("webgl", "fail", `WebGLが使えません。顔検出の多くはWebGLで動くため、カメラ画面に進めない原因になります。ロックダウンモード、またはSafariの機能フラグの変更が考えられます（${PATH.lockdown}／${PATH.flags}）`);
+      return false;
+    }
+    ctx.clearColor(0.2, 0.4, 0.6, 1);
+    ctx.clear(ctx.COLOR_BUFFER_BIT);
+    const px = new Uint8Array(4);
+    ctx.readPixels(0, 0, 1, 1, ctx.RGBA, ctx.UNSIGNED_BYTE, px);
+    const near = (v, t) => Math.abs(v - t) <= 2;
+    const renderer = String(ctx.getParameter(ctx.RENDERER) || "不明");
+    const ver = gl2 ? "WebGL2" : "WebGL1のみ";
+    if (!(near(px[0], 51) && near(px[1], 102) && near(px[2], 153))) {
+      set("webgl", "warn", `${ver} は使えますが、読み取り結果が想定と異なります（${px.slice(0, 3).join(",")}）。フィンガープリンティング保護の影響の可能性があります`);
+    } else {
+      set("webgl", gl2 ? "pass" : "warn", gl2 ? `${ver} / ${renderer}` : `${ver}。WebGL2が無効です。Safariの機能フラグが変更されている可能性があります（${PATH.flags}）`);
+    }
+    return true;
+  }
+
+  async function checkWasm() {
+    if (typeof WebAssembly !== "object" || !WebAssembly) {
+      set("wasm", "fail", `WebAssemblyが無効です。顔検出エンジンが動かないため、カメラ画面に進めません。ロックダウンモードがオンの可能性が高いです（${PATH.lockdown}）`);
+      return false;
+    }
+    const empty = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+    const simd = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]);
+    try {
+      await withTimeout(WebAssembly.instantiate(empty), 4000);
+    } catch (e) {
+      set("wasm", "fail", `WebAssemblyを実行できません（${errName(e)}）。ロックダウンモードの可能性があります（${PATH.lockdown}）`);
+      return false;
+    }
+    let simdOk = false;
+    try { simdOk = WebAssembly.validate(simd); } catch (e) { simdOk = false; }
+    if (!simdOk) {
+      set("wasm", "warn", `WebAssemblyは動きますが、SIMD（高速化命令）が使えません。対応環境として要求するサービスがあります。Safariの機能フラグを確認してください（${PATH.flags}）`);
+    } else {
+      set("wasm", "pass", "WebAssembly・SIMDともに使えます");
+    }
+    return true;
+  }
+
+  async function checkWorker() {
+    let w, url;
+    try {
+      url = URL.createObjectURL(new Blob(["onmessage=e=>postMessage(e.data*2)"], { type: "text/javascript" }));
+      w = new Worker(url);
+      const v = await withTimeout(new Promise((res, rej) => { w.onmessage = (e) => res(e.data); w.onerror = (e) => rej(e); w.postMessage(21); }), 4000);
+      if (v !== 42) throw new Error("応答が不正");
+      set("worker", "pass", "裏側での並列処理が使えます");
+    } catch (e) {
+      set("worker", "fail", `Web Workerが使えません（${errName(e)}）。顔検出を裏側で動かすサービスが止まります。Safariの機能フラグを確認してください（${PATH.flags}）`);
+    } finally {
+      if (w) w.terminate();
+      if (url) URL.revokeObjectURL(url);
+    }
+  }
+
+  async function checkWebRTC() {
+    if (typeof RTCPeerConnection !== "function") {
+      set("webrtc", "fail", `WebRTCが無効です。映像をリアルタイム送信する方式の顔認証が動きません。ロックダウンモードか機能フラグの変更が考えられます（${PATH.lockdown}／${PATH.flags}）`);
+      return;
+    }
+    set("webrtc", "running", "外部との通信経路を確認しています（最大6秒）");
+    let pc;
+    try {
+      pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+      const types = new Set();
+      const gathered = new Promise((res) => {
+        pc.onicecandidate = (e) => {
+          if (!e.candidate) { res(); return; }
+          const m = / typ (\w+)/.exec(e.candidate.candidate);
+          types.add(e.candidate.type || (m && m[1]) || "unknown");
+        };
+      });
+      pc.createDataChannel("check");
+      await pc.setLocalDescription(await pc.createOffer());
+      await Promise.race([gathered, sleep(6000)]);
+      if (types.has("srflx")) set("webrtc", "pass", `外部との映像通信経路を確保できます（${[...types].join(", ")}）`);
+      else set("webrtc", "warn", `外部の通信サーバー（STUN）から応答がありません（取得: ${types.size ? [...types].join(", ") : "なし"}）。回線・VPN・プライベートリレーでUDP通信が止められている可能性があります。映像をリアルタイム送信する方式の顔認証で失敗します`);
+    } catch (e) {
+      set("webrtc", "fail", `WebRTCを開始できません（${errName(e)}）`);
+    } finally {
+      if (pc) pc.close();
+    }
+  }
+
+  async function checkFont() {
+    const family = "IBM Plex Sans JP";
+    try {
+      await withTimeout(document.fonts.load(`16px "${family}"`, "あ"), 6000);
+    } catch (e) { /* 判定は下で行う */ }
+    const faces = [...document.fonts].filter((f) => f.family.replace(/["']/g, "") === family);
+    if (faces.length === 0) {
+      set("font", "warn", "フォントの定義ファイル（fonts.googleapis.com）を読み込めませんでした。コンテンツブロッカーかDNSフィルタで止められている可能性があります");
+      return "css";
+    }
+    if (!faces.some((f) => f.status === "loaded")) {
+      set("font", "warn", "フォントの定義は届いていますが、フォント本体が読み込まれていません。ロックダウンモードでよく起こる状態です");
+      return "file";
+    }
+    set("font", "pass", "外部のWebフォントを読み込めます");
+    return "ok";
+  }
+
+  async function settingsChecks() {
+    for (const [id] of SET_STEPS) set(id, "running", "確認しています");
+    checkFingerprint();
+    const webglOk = checkWebGL();
+    const [wasmOk, font] = await Promise.all([
+      checkWasm(), checkFont(), checkIP(), checkBlocker(), checkCDN(), checkStorage(), checkWorker(), checkWebRTC(),
+    ]).then((r) => [r[0], r[1]]);
+
+    const signs = [];
+    if (!webglOk) signs.push("WebGLが無効");
+    if (!wasmOk) signs.push("WebAssemblyが無効");
+    if (font === "file") signs.push("Webフォント本体が読み込まれない");
+    if (signs.length >= 2) {
+      set("lockdown", "fail", `ロックダウンモードがオンの可能性が高いです（${signs.join("・")}）。顔検出に必要な機能が止まります。オフにするか、Safariでこのサイトだけ除外してください（${PATH.lockdown}）`);
+    } else if (signs.length === 1) {
+      set("lockdown", "warn", `ロックダウンモードの兆候が1つあります（${signs[0]}）。念のため確認してください（${PATH.lockdown}）`);
+    } else {
+      set("lockdown", "pass", "ロックダウンモードの兆候はありません");
+    }
+    settingsDone = true;
     updateVerdict();
   }
 
-  /* ---------- カメラチェック ---------- */
+  /* ================= カメラ ================= */
   function gumMessage(e) {
     const map = {
       NotAllowedError: "カメラの使用が拒否されました。許可ダイアログで「許可しない」を選んだか、Safariのサイト設定・「設定 > アプリ > Safari > カメラ」が拒否になっています",
@@ -284,7 +605,7 @@ ol.steps li:first-child{border-top:0}
       OverconstrainedError: "指定したカメラ（前面/背面）がこの端末で使えません",
       AbortError: "カメラの起動が中断されました",
     };
-    return (map[e && e.name] || "カメラを起動できませんでした") + `（${e && e.name ? e.name : "不明なエラー"}）`;
+    return (map[e && e.name] || "カメラを起動できませんでした") + `（${errName(e)}）`;
   }
 
   function waitEvent(target, type, ms) {
@@ -334,6 +655,32 @@ ol.steps li:first-child{border-top:0}
     return { mean, sd: Math.sqrt(Math.max(0, sq / n - mean * mean)) };
   }
 
+  async function checkRecorder(s) {
+    if (typeof MediaRecorder !== "function") {
+      set("rec", "fail", `録画機能（MediaRecorder）が使えません。動きで本人確認をする方式（動画を送る方式）が失敗します。Safariの機能フラグを確認してください（${PATH.flags}）`);
+      return;
+    }
+    const mime = ["video/mp4", "video/webm"].find((t) => MediaRecorder.isTypeSupported(t));
+    set("rec", "running", "2秒間録画しています");
+    let rec;
+    try {
+      rec = new MediaRecorder(s, mime ? { mimeType: mime } : undefined);
+    } catch (e) {
+      set("rec", "fail", `録画を開始できません（${errName(e)}）`);
+      return;
+    }
+    const chunks = [];
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    const stopped = new Promise((r) => { rec.onstop = r; });
+    rec.start();
+    await sleep(2000);
+    if (rec.state !== "inactive") rec.stop();
+    await withTimeout(stopped, 4000).catch(() => {});
+    const size = chunks.reduce((a, b) => a + b.size, 0);
+    if (size > 0) set("rec", "pass", `録画できました（${rec.mimeType || mime || "形式不明"} / ${Math.round(size / 1024)}KB）`);
+    else set("rec", "fail", "録画を開始できましたが、データが作られませんでした。動画を送る方式の本人確認が失敗します");
+  }
+
   function waitTapPlay() {
     btnTap.hidden = false;
     return new Promise((resolve) => {
@@ -357,9 +704,7 @@ ol.steps li:first-child{border-top:0}
     btnStart.disabled = true;
     btnStop.disabled = false;
     for (const [id] of CAM_STEPS) set(id, "pending", "");
-    updateVerdict();
 
-    // 1. 起動
     set("gum", "running", "カメラを起動しています。許可ダイアログが出たら「許可」を選んでください");
     try {
       stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { exact: facing } }, audio: false });
@@ -377,7 +722,6 @@ ol.steps li:first-child{border-top:0}
     }
     set("gum", "pass", `起動しました（${track.label || "名称なし"}）。緑のインジケーターが点灯している状態です`);
 
-    // 2. トラック
     const s = track.getSettings ? track.getSettings() : {};
     const size = s.width && s.height ? `${s.width}×${s.height}` : "サイズ不明";
     if (track.readyState !== "live") {
@@ -389,10 +733,8 @@ ol.steps li:first-child{border-top:0}
     else set("track", "pass", `映像が流れています（${size}${s.frameRate ? " / " + Math.round(s.frameRate) + "fps" : ""}）`);
     track.addEventListener("ended", () => {
       if (running) set("track", "fail", "チェック中に映像トラックが終了しました");
-      updateVerdict();
     });
 
-    // 3. 再生
     video.classList.toggle("mirror", facing === "user");
     video.hidden = false;
     $("placeholder").hidden = true;
@@ -406,17 +748,16 @@ ol.steps li:first-child{border-top:0}
     } catch (e) {
       if (e && e.name === "NotAllowedError") {
         set("play", "warn", "自動再生がブロックされました。下の「タップして映像を再生」を押してください");
-        updateVerdict();
         const r = await waitTapPlay();
         if (!running) return;
         if (r === true) {
           played = true;
           set("play", "warn", "タップすれば再生できますが、自動再生はブロックされています。低電力モードがオンの可能性があります。顔認証サイトで画面が切り替わらない原因になります");
         } else {
-          set("play", "fail", `タップしても再生できませんでした（${r && r.name ? r.name : "不明なエラー"}）`);
+          set("play", "fail", `タップしても再生できませんでした（${errName(r)}）`);
         }
       } else {
-        set("play", "fail", `プレビューを再生できませんでした（${e && e.name ? e.name : "不明なエラー"}）`);
+        set("play", "fail", `プレビューを再生できませんでした（${errName(e)}）`);
       }
     }
     if (!played) {
@@ -425,7 +766,6 @@ ol.steps li:first-child{border-top:0}
     }
     $("live").hidden = false;
 
-    // 4. フレーム
     set("frames", "running", "映像フレームを確認しています（約2秒）");
     if (video.videoWidth === 0) await waitEvent(video, "loadedmetadata", 5000);
     const fr = await countFrames(2000);
@@ -440,19 +780,19 @@ ol.steps li:first-child{border-top:0}
     if (fps < 5) set("frames", "warn", `フレームの間隔が極端に遅いです（約${fps}fps / ${vw}×${vh}）`);
     else set("frames", "pass", `映像が届いています（約${fps}fps / ${vw}×${vh}）`);
 
-    // 5. 明るさ
-    let lm;
     try {
-      lm = measureLight();
+      const lm = measureLight();
+      const mean = Math.round(lm.mean);
+      if (lm.mean < 6 && lm.sd < 3) set("light", "fail", `映像が真っ黒です（平均輝度 ${mean}/255）。レンズが覆われていないか確認してください`);
+      else if (lm.mean < 40) set("light", "warn", `映像が暗いです（平均輝度 ${mean}/255）。顔認証が失敗しやすいため明るい場所で行ってください`);
+      else if (lm.sd < 2) set("light", "warn", `映像がほぼ単色です（平均輝度 ${mean}/255）。カメラの前に何かありませんか`);
+      else set("light", "pass", `正常に映っています（平均輝度 ${mean}/255）`);
     } catch (e) {
-      set("light", "fail", `映像を解析できませんでした（${e && e.name ? e.name : "不明なエラー"}）`);
-      return finish();
+      set("light", "fail", `映像を解析できませんでした（${errName(e)}）。顔検出は映像の読み取りが前提のため動きません`);
     }
-    const mean = Math.round(lm.mean);
-    if (lm.mean < 6 && lm.sd < 3) set("light", "fail", `映像が真っ黒です（平均輝度 ${mean}/255）。レンズが覆われていないか確認してください`);
-    else if (lm.mean < 40) set("light", "warn", `映像が暗いです（平均輝度 ${mean}/255）。顔認証が失敗しやすいため明るい場所で行ってください`);
-    else if (lm.sd < 2) set("light", "warn", `映像がほぼ単色です（平均輝度 ${mean}/255）。カメラの前に何かありませんか`);
-    else set("light", "pass", `正常に映っています（平均輝度 ${mean}/255）`);
+
+    if (!running) return;
+    await checkRecorder(stream);
     finish();
   }
 
@@ -481,33 +821,36 @@ ol.steps li:first-child{border-top:0}
     for (const [id] of CAM_STEPS) {
       if (state[id].status === "running" || state[id].status === "pending") set(id, "skip", "停止したため未実施です");
     }
-    updateVerdict();
   }
 
-  /* ---------- 判定 ---------- */
+  /* ================= 判定 ================= */
   function updateVerdict() {
-    const all = [...ENV_STEPS, ...CAM_STEPS].map(([id]) => state[id]);
+    if (!ALL_STEPS.every(([id]) => id in state)) return;
+    const all = ALL_STEPS.map(([id]) => state[id]);
     const worst = all.reduce((a, b) => (SEVERITY[b.status] > SEVERITY[a.status] ? b : a));
     const camDone = CAM_STEPS.every(([id]) => ["pass", "warn", "fail", "skip"].includes(state[id].status));
     const camAllPass = CAM_STEPS.every(([id]) => state[id].status === "pass");
-    const v = $("verdict");
+    const issues = all.filter((s) => s.status === "fail" || s.status === "warn").length;
     let s, title, detail;
     if (worst.status === "fail") {
-      s = "fail"; title = "カメラを正常に使えません"; detail = `${worst.title}：${worst.detail}`;
+      s = "fail"; title = `問題が見つかりました（${issues}件）`; detail = `${worst.title}：${worst.detail}`;
     } else if (worst.status === "warn") {
-      s = "warn"; title = "注意が必要な項目があります"; detail = `${worst.title}：${worst.detail}`;
+      s = "warn"; title = `注意が必要な項目があります（${issues}件）`; detail = `${worst.title}：${worst.detail}`;
+    } else if (!settingsDone) {
+      s = "pending"; title = "確認中"; detail = "設定の確認が終わるまでお待ちください。";
     } else if (camDone && camAllPass) {
-      s = "pass"; title = "カメラは正常に起動し、映像も映っています";
-      detail = "このブラウザでは顔認証のカメラが動く状態です。それでも失敗する場合はサービス側の問題の可能性があります";
+      s = "pass"; title = "設定・カメラともに問題は見つかりませんでした";
+      detail = "このページで検出できる範囲では正常です。それでも顔認証が失敗する場合は、サービス側の非対応の可能性が高いです";
     } else {
-      s = "pending"; title = "未チェック"; detail = "「チェック開始」をタップしてください。";
+      s = "pending"; title = "設定に問題はありません"; detail = "続けて「チェック開始」をタップし、カメラを確認してください。";
     }
+    const v = $("verdict");
     v.dataset.s = s;
     $("verdict-title").textContent = title;
     $("verdict-detail").textContent = detail;
   }
 
-  /* ---------- 診断結果のコピー ---------- */
+  /* ================= 診断結果のコピー ================= */
   function report() {
     const lines = [
       "【カメラ起動チェック結果】",
@@ -516,7 +859,7 @@ ol.steps li:first-child{border-top:0}
       "判定: " + $("verdict-title").textContent,
       "",
     ];
-    for (const [id] of [...ENV_STEPS, ...CAM_STEPS]) {
+    for (const [id] of ALL_STEPS) {
       const s = state[id];
       lines.push(`[${LABEL[s.status]}] ${s.title}${s.detail ? "：" + s.detail : ""}`);
     }
@@ -552,7 +895,7 @@ ol.steps li:first-child{border-top:0}
     }
   });
 
-  /* ---------- 操作 ---------- */
+  /* ================= 操作 ================= */
   function setFacing(f) {
     facing = f;
     $("cam-user").setAttribute("aria-pressed", String(f === "user"));
@@ -566,9 +909,11 @@ ol.steps li:first-child{border-top:0}
   window.addEventListener("pagehide", stopStream);
 
   buildList($("steps-env"), ENV_STEPS);
+  buildList($("steps-set"), SET_STEPS);
   buildList($("steps-cam"), CAM_STEPS);
   $("ua").textContent = navigator.userAgent;
   envChecks();
+  settingsChecks();
 })();
 </script>
 </body>
